@@ -24,6 +24,10 @@ try:
 except ImportError:
     HAS_SHM = False
 
+CONFIG_FILE = Path("config.json")
+LEGACY_CALIBRATION_FILE = Path("calibration.json")
+LEGACY_STANDARDS_FILE = Path("standards.json")
+
 # =====================================================
 # DIN45681 TONALITY
 # =====================================================
@@ -562,9 +566,11 @@ def load_audio(filename):
 
 LOUDNESS_ISO = "ISO 532-1 (Zwicker)"
 LOUDNESS_ECMA = "ECMA-418 (HMS)"
+LOUDNESS_OPTIONS = [LOUDNESS_ISO, LOUDNESS_ECMA]
 
 TONALITY_DIN = "DIN 45681"
 TONALITY_ECMA = "ECMA-418 (HMS)"
+TONALITY_OPTIONS = [TONALITY_DIN, TONALITY_ECMA]
 
 
 class LoudnessAnalyzer:
@@ -587,11 +593,7 @@ class LoudnessAnalyzer:
         self.tone_frequency_time = np.array([])
         self.tonality_overall = np.nan
 
-        try:
-            with open("calibration.json", "r") as f:
-                self.calibration_factor = json.load(f)["factor"]
-        except Exception:
-            pass
+        self.load_config()
 
         # ================= TOP TITLE =================
         tk.Label(
@@ -631,15 +633,18 @@ class LoudnessAnalyzer:
             font=("Arial", 9, "bold"),
         ).pack(anchor="w")
 
-        self.loudness_method_var = tk.StringVar(value=LOUDNESS_ISO)
+        self.loudness_method_var = tk.StringVar(value=self.loudness_mode)
         self.loudness_combo = ttk.Combobox(
             left_frame,
             textvariable=self.loudness_method_var,
-            values=[LOUDNESS_ISO, LOUDNESS_ECMA],
+            values=LOUDNESS_OPTIONS,
             state="readonly",
             width=22,
         )
         self.loudness_combo.pack(anchor="w", pady=(2, 6))
+        self.loudness_combo.bind(
+            "<<ComboboxSelected>>", self.on_standard_selected
+        )
 
         tk.Label(
             left_frame,
@@ -647,15 +652,18 @@ class LoudnessAnalyzer:
             font=("Arial", 9, "bold"),
         ).pack(anchor="w")
 
-        self.tonality_method_var = tk.StringVar(value=TONALITY_DIN)
+        self.tonality_method_var = tk.StringVar(value=self.tonality_mode)
         self.tonality_combo = ttk.Combobox(
             left_frame,
             textvariable=self.tonality_method_var,
-            values=[TONALITY_DIN, TONALITY_ECMA],
+            values=TONALITY_OPTIONS,
             state="readonly",
             width=22,
         )
         self.tonality_combo.pack(anchor="w", pady=(2, 0))
+        self.tonality_combo.bind(
+            "<<ComboboxSelected>>", self.on_standard_selected
+        )
 
         # --- CENTER COLUMN: File Selection & Run ---
         center_frame = tk.Frame(control_frame)
@@ -711,6 +719,100 @@ class LoudnessAnalyzer:
         self.result_text.pack(fill="both", expand=True, padx=20, pady=15)
 
     # =================================================
+    def load_config(self):
+        loaded_from_config = False
+        try:
+            if CONFIG_FILE.exists():
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    if "factor" in data and data["factor"] is not None:
+                        self.calibration_factor = float(data["factor"])
+                    saved_loudness = data.get("loudness_standard")
+                    saved_tonality = data.get("tonality_standard")
+                    if saved_loudness in LOUDNESS_OPTIONS:
+                        self.loudness_mode = saved_loudness
+                    if saved_tonality in TONALITY_OPTIONS:
+                        self.tonality_mode = saved_tonality
+                    loaded_from_config = True
+        except Exception:
+            pass
+
+        if loaded_from_config:
+            return
+
+        # Fallback to legacy files if config.json does not exist yet
+        try:
+            if LEGACY_CALIBRATION_FILE.exists():
+                with open(LEGACY_CALIBRATION_FILE, "r", encoding="utf-8") as f:
+                    cal_data = json.load(f)
+                if isinstance(cal_data, dict) and "factor" in cal_data:
+                    self.calibration_factor = float(cal_data["factor"])
+        except Exception:
+            pass
+
+        try:
+            if LEGACY_STANDARDS_FILE.exists():
+                with open(LEGACY_STANDARDS_FILE, "r", encoding="utf-8") as f:
+                    std_data = json.load(f)
+                if isinstance(std_data, dict):
+                    saved_loudness = std_data.get("loudness_standard")
+                    saved_tonality = std_data.get("tonality_standard")
+                    if saved_loudness in LOUDNESS_OPTIONS:
+                        self.loudness_mode = saved_loudness
+                    if saved_tonality in TONALITY_OPTIONS:
+                        self.tonality_mode = saved_tonality
+        except Exception:
+            pass
+
+    def save_config(
+        self,
+        factor=None,
+        loudness_standard=None,
+        tonality_standard=None,
+    ):
+        factor_val = (
+            float(factor)
+            if factor is not None
+            else float(self.calibration_factor)
+        )
+        loudness_val = (
+            loudness_standard
+            if loudness_standard is not None
+            else self.loudness_method_var.get()
+        )
+        tonality_val = (
+            tonality_standard
+            if tonality_standard is not None
+            else self.tonality_method_var.get()
+        )
+
+        if loudness_val not in LOUDNESS_OPTIONS:
+            loudness_val = LOUDNESS_ISO
+        if tonality_val not in TONALITY_OPTIONS:
+            tonality_val = TONALITY_DIN
+
+        self.calibration_factor = factor_val
+        self.loudness_mode = loudness_val
+        self.tonality_mode = tonality_val
+
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "factor": factor_val,
+                        "loudness_standard": loudness_val,
+                        "tonality_standard": tonality_val,
+                    },
+                    f,
+                    indent=4,
+                )
+        except Exception:
+            pass
+
+    def on_standard_selected(self, _event=None):
+        self.save_config()
+
     def calibrate_from_spl(self):
         cal_file = filedialog.askopenfilename(
             title="Select Recording Used For SPL Measurement",
@@ -739,10 +841,8 @@ class LoudnessAnalyzer:
                 raise Exception("Invalid recording")
 
             pressure_pa = 20e-6 * 10 ** (spl / 20)
-            self.calibration_factor = pressure_pa / rms
-
-            with open("calibration.json", "w") as f:
-                json.dump({"factor": self.calibration_factor}, f, indent=4)
+            factor = float(pressure_pa / rms)
+            self.save_config(factor=factor)
 
             self.cal_label.config(
                 text=f"Calibration Factor: {self.calibration_factor:.6f}"
@@ -776,8 +876,10 @@ class LoudnessAnalyzer:
             messagebox.showerror("Error", "Please select a file.")
             return
 
-        self.loudness_mode = self.loudness_method_var.get()
-        self.tonality_mode = self.tonality_method_var.get()
+        self.save_config(
+            loudness_standard=self.loudness_method_var.get(),
+            tonality_standard=self.tonality_method_var.get(),
+        )
         threading.Thread(target=self.analyze_file, daemon=True).start()
 
     def analyze_file(self):
