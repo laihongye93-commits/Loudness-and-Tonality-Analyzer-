@@ -6,3 +6,4 @@ scipy>=1.11
 mosqito>=1.2
 openpyxl>=3.1
 plotly>=5.20
+sottek-hearing-model>=0.1.14
