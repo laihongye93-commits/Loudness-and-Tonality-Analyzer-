@@ -185,11 +185,15 @@ def tonality_vs_time(signal, fs, window_sec=3.0, overlap=0.5):
 
 
 # =====================================================
-# ECMA-418 / HMS TONALITY (tuHMS)
+# ECMA-418 / HMS TONALITY (tuHMS) & LOUDNESS (soneHMS)
 # =====================================================
 
 
-def _extract_shm_series(obj, hop_sec=0.05):
+def _extract_shm_series(
+    obj,
+    value_keys=("tonality", "tonality_t", "T_t", "T", "values"),
+    hop_sec=0.05,
+):
     if isinstance(obj, dict):
         t_val = None
         for k in ("t", "time", "time_axis", "times"):
@@ -198,7 +202,7 @@ def _extract_shm_series(obj, hop_sec=0.05):
                 break
 
         y_val = None
-        for k in ("tonality", "tonality_t", "T_t", "T", "values"):
+        for k in value_keys:
             if k in obj and obj[k] is not None:
                 y_val = np.asarray(obj[k], dtype=np.float64)
                 break
@@ -238,10 +242,6 @@ def _extract_shm_series(obj, hop_sec=0.05):
 def ecma418_tonality_analysis(signal, fs):
     """
     Computes ECMA-418-2 / Sottek Hearing Model tonality (tuHMS).
-    Returns:
-        overall_tuhms (float)
-        times (np.ndarray)
-        tuhms_t (np.ndarray)
     """
     signal = np.asarray(signal, dtype=np.float64)
     duration = len(signal) / fs if fs > 0 else 0.0
@@ -251,10 +251,10 @@ def ecma418_tonality_analysis(signal, fs):
 
     tonality_fn = None
     for attr_name in (
+        "shm_tonality_ecma",
         "shm_tonality",
         "tonality_hms",
         "tonality",
-        "acoustic_shm_tonality",
     ):
         candidate = getattr(shm, attr_name, None)
         if callable(candidate):
@@ -281,7 +281,18 @@ def ecma418_tonality_analysis(signal, fs):
     times = np.array([0.0])
     tuhms_t = np.array([np.nan])
 
-    if isinstance(res, tuple):
+    if isinstance(res, dict):
+        for k in ("tonality_avg", "T", "tonality", "tonality_overall", "overall"):
+            if k in res and np.ndim(res[k]) == 0:
+                overall_tuhms = float(res[k])
+                break
+        times, tuhms_t = _extract_shm_series(
+            res,
+            value_keys=("tonality_t", "tonality_t_avg", "tonality", "T_t", "T"),
+        )
+        if np.isnan(overall_tuhms) and len(tuhms_t):
+            overall_tuhms = float(np.nanmax(tuhms_t))
+    elif isinstance(res, tuple):
         if len(res) >= 1 and np.ndim(res[0]) == 0:
             overall_tuhms = float(res[0])
         if len(res) >= 2:
@@ -289,14 +300,6 @@ def ecma418_tonality_analysis(signal, fs):
         elif len(res) >= 1 and np.ndim(res[0]) >= 1:
             times, tuhms_t = _extract_shm_series(res[0])
             overall_tuhms = float(np.nanmax(tuhms_t)) if len(tuhms_t) else np.nan
-    elif isinstance(res, dict):
-        for k in ("T", "tonality", "tonality_overall", "overall"):
-            if k in res and np.ndim(res[k]) == 0:
-                overall_tuhms = float(res[k])
-                break
-        times, tuhms_t = _extract_shm_series(res)
-        if np.isnan(overall_tuhms) and len(tuhms_t):
-            overall_tuhms = float(np.nanmax(tuhms_t))
     else:
         times, tuhms_t = _extract_shm_series(res)
         overall_tuhms = float(np.nanmax(tuhms_t)) if len(tuhms_t) else np.nan
@@ -309,6 +312,179 @@ def ecma418_tonality_analysis(signal, fs):
         overall_tuhms = float(np.nanmax(tuhms_t))
 
     return overall_tuhms, times, tuhms_t
+
+
+def ecma418_loudness_analysis(signal, fs):
+    """
+    Computes ECMA-418-2 / Sottek Hearing Model loudness (soneHMS).
+    """
+    signal = np.asarray(signal, dtype=np.float64)
+    duration = len(signal) / fs if fs > 0 else 0.0
+    # ECMA-418-2 uses 53 critical bands spanning 0.5 to 26.5 Bark (0.5 Bark steps)
+    default_bark = np.arange(0.5, 27.0, 0.5)
+
+    if not HAS_SHM:
+        return (
+            np.nan,
+            np.linspace(0.0, duration, 1),
+            np.array([np.nan]),
+            default_bark,
+            np.full_like(default_bark, np.nan),
+        )
+
+    loudness_fn = None
+    for attr_name in (
+        "shm_loudness_ecma",
+        "shm_loudness",
+        "loudness_hms",
+        "loudness",
+    ):
+        candidate = getattr(shm, attr_name, None)
+        if callable(candidate):
+            loudness_fn = candidate
+            break
+
+    if loudness_fn is None:
+        for name in dir(shm):
+            if "loudness" in name.lower():
+                candidate = getattr(shm, name, None)
+                if callable(candidate):
+                    loudness_fn = candidate
+                    break
+
+    if loudness_fn is None:
+        return (
+            np.nan,
+            np.linspace(0.0, duration, 1),
+            np.array([np.nan]),
+            default_bark,
+            np.full_like(default_bark, np.nan),
+        )
+
+    try:
+        res = loudness_fn(signal, fs)
+    except TypeError:
+        res = loudness_fn(signal, sample_rate=fs)
+
+    overall_N = np.nan
+    times = np.array([0.0])
+    loudness_t = np.array([np.nan])
+    bark_axis = None
+    specific_N = None
+    loudness_keys = (
+        "loudness_t",
+        "loudness_t_avg",
+        "loudness",
+        "N_t",
+        "N",
+        "values",
+    )
+
+    if isinstance(res, dict):
+        # 1. Overall loudness scalar
+        for k in (
+            "loudness_powavg",
+            "loudness_avg",
+            "loudness_N5",
+            "loudness",
+            "N",
+            "overall",
+        ):
+            if k in res and res[k] is not None and np.ndim(res[k]) == 0:
+                overall_N = float(res[k])
+                break
+
+        # 2. Time-varying loudness
+        times, loudness_t = _extract_shm_series(res, value_keys=loudness_keys)
+
+        # 3. Critical band axis (Hz -> Bark if band_centre_freqs is returned)
+        for k in ("bark", "bark_axis", "critical_band_rate", "z"):
+            if k in res and res[k] is not None:
+                bark_axis = np.asarray(res[k], dtype=np.float64).ravel()
+                break
+
+        if bark_axis is None and "band_centre_freqs" in res and res["band_centre_freqs"] is not None:
+            freqs_hz = np.asarray(res["band_centre_freqs"], dtype=np.float64).ravel()
+            # Convert centre frequencies (Hz) to Bark scale
+            bark_axis = (
+                13.0 * np.arctan(0.00076 * freqs_hz)
+                + 3.5 * np.arctan((freqs_hz / 7500.0) ** 2)
+            )
+
+        # 4. Specific loudness (matches `spec_loudness` in mlotinga/sottek-hearing-model)
+        for k in (
+            "spec_loudness",
+            "spec_loudness_avg",
+            "specific_loudness",
+            "N_specific",
+            "N_prime",
+            "specific",
+        ):
+            if k in res and res[k] is not None:
+                arr = np.asarray(res[k], dtype=np.float64)
+                if arr.ndim == 3:
+                    # Shape: (time, bands, channels) -> average across time & channels
+                    specific_N = np.nanmean(arr, axis=(0, 2))
+                elif arr.ndim == 2:
+                    # Average along the time axis (whichever axis matches len(times))
+                    if len(times) > 1 and arr.shape[0] == len(times):
+                        specific_N = np.nanmean(arr, axis=0)
+                    elif len(times) > 1 and arr.shape[1] == len(times):
+                        specific_N = np.nanmean(arr, axis=1)
+                    else:
+                        # Standard SHM has 53 bands
+                        time_axis = 1 if arr.shape[0] == 53 else 0
+                        specific_N = np.nanmean(arr, axis=time_axis)
+                else:
+                    specific_N = arr.ravel()
+                break
+
+        # Fallback: scan any remaining 2D array in dict that isn't time-only
+        if specific_N is None:
+            for k, v in res.items():
+                if v is None:
+                    continue
+                arr = np.asarray(v, dtype=np.float64)
+                if arr.ndim >= 2 and 53 in arr.shape:
+                    time_axis = 1 if arr.shape[0] == 53 else 0
+                    specific_N = np.nanmean(arr, axis=time_axis).ravel()
+                    break
+
+    elif isinstance(res, tuple):
+        if len(res) >= 1 and np.ndim(res[0]) == 0:
+            overall_N = float(res[0])
+        if len(res) >= 2:
+            times, loudness_t = _extract_shm_series(
+                res[1], value_keys=loudness_keys
+            )
+        elif len(res) >= 1 and np.ndim(res[0]) >= 1:
+            times, loudness_t = _extract_shm_series(
+                res[0], value_keys=loudness_keys
+            )
+
+        if len(res) >= 3:
+            arr2 = np.asarray(res[2], dtype=np.float64)
+            specific_N = np.nanmean(arr2, axis=0) if arr2.ndim > 1 else arr2.ravel()
+        if len(res) >= 4:
+            bark_axis = np.asarray(res[3], dtype=np.float64).ravel()
+
+    else:
+        times, loudness_t = _extract_shm_series(res, value_keys=loudness_keys)
+
+    if (
+        np.isnan(overall_N)
+        and len(loudness_t)
+        and not np.all(np.isnan(loudness_t))
+    ):
+        overall_N = float(np.nanmean(loudness_t))
+
+    if specific_N is None:
+        bark_axis = default_bark
+        specific_N = np.full_like(default_bark, np.nan)
+    elif bark_axis is None or len(bark_axis) != len(specific_N):
+        bark_axis = np.arange(1, len(specific_N) + 1, dtype=np.float64) * 0.5
+
+    return overall_N, times, loudness_t, bark_axis, specific_N
 
 
 # =====================================================
@@ -356,8 +532,8 @@ def calculate_dba(signal, fs):
 
 
 def sone_to_phon(sone):
-    if sone <= 0:
-        return 0
+    if sone <= 0 or np.isnan(sone):
+        return 0.0
 
     return 40 + 10 * np.log2(sone)
 
@@ -384,6 +560,9 @@ def load_audio(filename):
 # GUI
 # =====================================================
 
+LOUDNESS_ISO = "ISO 532-1 (Zwicker)"
+LOUDNESS_ECMA = "ECMA-418 (HMS)"
+
 TONALITY_DIN = "DIN 45681"
 TONALITY_ECMA = "ECMA-418 (HMS)"
 
@@ -393,13 +572,14 @@ class LoudnessAnalyzer:
     def __init__(self, root):
         self.root = root
         self.root.title("Acoustic Analyzer")
-        self.root.geometry("1000x850")
+        self.root.geometry("1000x880")
 
         self.filename = None
         self.calibration_factor = 1.0
         self.peak_frequency = 0.0
 
-        # Tonality state attributes
+        # Loudness & Tonality state attributes
+        self.loudness_mode = LOUDNESS_ISO
         self.tonality_mode = TONALITY_DIN
         self.tonality_axis = np.array([])
         self.tonality_time = np.array([])
@@ -416,7 +596,7 @@ class LoudnessAnalyzer:
         # ================= TOP TITLE =================
         tk.Label(
             root,
-            text="ISO 532 Loudness & Tonality Analyzer",
+            text="Loudness & Tonality Analyzer",
             font=("Arial", 16, "bold"),
         ).pack(pady=(15, 10))
 
@@ -428,7 +608,7 @@ class LoudnessAnalyzer:
         control_frame.grid_columnconfigure(1, weight=1)
         control_frame.grid_columnconfigure(2, weight=1)
 
-        # --- LEFT COLUMN: Calibration & Tonality Method ---
+        # --- LEFT COLUMN: Calibration, Loudness & Tonality Methods ---
         left_frame = tk.Frame(control_frame)
         left_frame.grid(row=0, column=0, sticky="w")
 
@@ -447,6 +627,22 @@ class LoudnessAnalyzer:
 
         tk.Label(
             left_frame,
+            text="Loudness Standard:",
+            font=("Arial", 9, "bold"),
+        ).pack(anchor="w")
+
+        self.loudness_method_var = tk.StringVar(value=LOUDNESS_ISO)
+        self.loudness_combo = ttk.Combobox(
+            left_frame,
+            textvariable=self.loudness_method_var,
+            values=[LOUDNESS_ISO, LOUDNESS_ECMA],
+            state="readonly",
+            width=22,
+        )
+        self.loudness_combo.pack(anchor="w", pady=(2, 6))
+
+        tk.Label(
+            left_frame,
             text="Tonality Standard:",
             font=("Arial", 9, "bold"),
         ).pack(anchor="w")
@@ -457,7 +653,7 @@ class LoudnessAnalyzer:
             textvariable=self.tonality_method_var,
             values=[TONALITY_DIN, TONALITY_ECMA],
             state="readonly",
-            width=20,
+            width=22,
         )
         self.tonality_combo.pack(anchor="w", pady=(2, 0))
 
@@ -580,6 +776,7 @@ class LoudnessAnalyzer:
             messagebox.showerror("Error", "Please select a file.")
             return
 
+        self.loudness_mode = self.loudness_method_var.get()
         self.tonality_mode = self.tonality_method_var.get()
         threading.Thread(target=self.analyze_file, daemon=True).start()
 
@@ -596,20 +793,42 @@ class LoudnessAnalyzer:
             self.result_text.insert(tk.END, f"Sample Rate: {fs} Hz\n")
             self.result_text.insert(tk.END, f"Duration: {duration:.2f} sec\n")
             self.result_text.insert(
+                tk.END, f"Loudness Standard: {self.loudness_mode}\n"
+            )
+            self.result_text.insert(
                 tk.END, f"Tonality Standard: {self.tonality_mode}\n\n"
             )
 
-            N, N_specific, bark_axis = loudness_zwst(signal, fs)
-            self.bark_axis = bark_axis
-            self.N_specific = N_specific
+            is_ecma_loudness = self.loudness_mode == LOUDNESS_ECMA
+            sone_unit = "soneHMS" if is_ecma_loudness else "sones"
+
+            # Always compute Zwicker loudness for DIN Sharpness compatibility
+            N_zw, N_spec_zw, bark_zw = loudness_zwst(signal, fs)
+            sharpness = sharpness_din_from_loudness(N_zw, N_spec_zw)
+
+            if is_ecma_loudness:
+                self.result_text.insert(
+                    tk.END, "Generating ECMA-418 (HMS) loudness profile...\n"
+                )
+                N, times_hms, sones_hms, bark_axis, N_specific = (
+                    ecma418_loudness_analysis(signal, fs)
+                )
+                self.bark_axis = bark_axis
+                self.N_specific = N_specific
+                self.save_and_plot_profile(times_hms, sones_hms, sone_unit)
+            else:
+                N = float(N_zw)
+                self.bark_axis = bark_zw
+                self.N_specific = N_spec_zw
+                self.compute_zwicker_profile(signal, fs, sone_unit)
 
             phon = sone_to_phon(float(N))
-            sharpness = sharpness_din_from_loudness(N, N_specific)
             dba = calculate_dba(signal, fs)
 
-            self.compute_profile(signal, fs)
             tonality_png = self.plot_tonality(signal, fs)
-            self.plot_specific_loudness(bark_axis, N_specific)
+            self.plot_specific_loudness(
+                self.bark_axis, self.N_specific, sone_unit
+            )
             spectrum_png = self.plot_frequency_spectrum(signal, fs)
 
             if self.tonality_mode == TONALITY_ECMA:
@@ -628,8 +847,17 @@ class LoudnessAnalyzer:
                     f"Tonality (DIN45681): {max_kt:.1f} dB (max Kt)\n"
                 )
 
+            if is_ecma_loudness and np.isnan(N):
+                loudness_summary_line = (
+                    "Loudness      : N/A (install sottek-hearing-model)\n"
+                )
+            else:
+                loudness_summary_line = (
+                    f"Loudness      : {float(N):.2f} {sone_unit}\n"
+                )
+
             self.result_text.insert(tk.END, "\n===== OVERALL RESULTS =====\n\n")
-            self.result_text.insert(tk.END, f"Loudness      : {N:.2f} sones\n")
+            self.result_text.insert(tk.END, loudness_summary_line)
             self.result_text.insert(tk.END, f"Phon Level    : {phon:.2f} phon\n")
             self.result_text.insert(tk.END, f"Sharpness     : {sharpness:.2f} acum\n")
             self.result_text.insert(tk.END, tonality_summary_line)
@@ -649,6 +877,15 @@ class LoudnessAnalyzer:
                 ws = wb.active
                 ws.title = "Summary"
 
+                loudness_header = (
+                    "Loudness ECMA-418 (soneHMS)"
+                    if is_ecma_loudness
+                    else "Loudness ISO 532-1 (sone)"
+                )
+                loudness_val = (
+                    round(float(N), 2) if not np.isnan(N) else "N/A"
+                )
+
                 if self.tonality_mode == TONALITY_ECMA:
                     tonality_header = "Tonality ECMA-418 (tuHMS)"
                     tonality_val = (
@@ -665,7 +902,7 @@ class LoudnessAnalyzer:
                     )
 
                 ws["A1"] = "File"
-                ws["B1"] = "Loudness (Sone)"
+                ws["B1"] = loudness_header
                 ws["C1"] = "Phon"
                 ws["D1"] = "Sharpness (Acum)"
                 ws["E1"] = "SPL dB(A)"
@@ -673,7 +910,7 @@ class LoudnessAnalyzer:
                 ws["G1"] = tonality_header
 
                 ws["A2"] = Path(self.filename).name
-                ws["B2"] = round(float(N), 2)
+                ws["B2"] = loudness_val
                 ws["C2"] = round(float(phon), 2)
                 ws["D2"] = round(float(sharpness), 2)
                 ws["E2"] = round(float(dba), 2)
@@ -775,13 +1012,15 @@ class LoudnessAnalyzer:
         except Exception as e:
             messagebox.showerror("Analysis Error", str(e))
 
-    def compute_profile(self, signal, fs):
+    def compute_zwicker_profile(self, signal, fs, unit_label="sones"):
         window = int(0.5 * fs)
         hop = int(0.1 * fs)
         times = []
         sones = []
 
-        self.result_text.insert(tk.END, "Generating loudness profile...\n")
+        self.result_text.insert(
+            tk.END, "Generating ISO 532-1 (Zwicker) loudness profile...\n"
+        )
 
         for start in range(0, len(signal) - window, hop):
             try:
@@ -793,23 +1032,36 @@ class LoudnessAnalyzer:
             except Exception:
                 pass
 
-        if len(sones):
-            avg_sone = np.mean(sones)
-            min_sone = np.min(sones)
-            max_sone = np.max(sones)
+        self.save_and_plot_profile(times, sones, unit_label)
+
+    def save_and_plot_profile(self, times, sones, unit_label="sones"):
+        sones_arr = np.asarray(sones, dtype=np.float64)
+        valid_sones = (
+            sones_arr[~np.isnan(sones_arr)] if len(sones_arr) else np.array([])
+        )
+
+        if len(valid_sones):
+            avg_sone = float(np.mean(valid_sones))
+            min_sone = float(np.min(valid_sones))
+            max_sone = float(np.max(valid_sones))
 
             self.result_text.insert(
-                tk.END, f"Average Loudness : {avg_sone:.2f} sones\n"
+                tk.END, f"Average Loudness : {avg_sone:.2f} {unit_label}\n"
             )
             self.result_text.insert(
-                tk.END, f"Peak Loudness    : {max_sone:.2f} sones\n"
+                tk.END, f"Peak Loudness    : {max_sone:.2f} {unit_label}\n"
             )
             self.result_text.insert(
-                tk.END, f"Minimum Loudness : {min_sone:.2f} sones\n\n"
+                tk.END, f"Minimum Loudness : {min_sone:.2f} {unit_label}\n\n"
             )
 
         if self.save_csv_var.get():
-            profile_df = pd.DataFrame({"Time_s": times, "Loudness_Sone": sones})
+            col_name = (
+                "Loudness_soneHMS"
+                if self.loudness_mode == LOUDNESS_ECMA
+                else "Loudness_Sone"
+            )
+            profile_df = pd.DataFrame({"Time_s": times, col_name: sones})
             csv_file = Path(self.filename).with_suffix(".loudness.csv")
             profile_df.to_csv(csv_file, index=False)
             self.result_text.insert(tk.END, f"Profile saved:\n{csv_file}\n\n")
@@ -818,10 +1070,20 @@ class LoudnessAnalyzer:
         self.loudness_time = sones
 
         plt.figure(figsize=(10, 5))
-        plt.plot(times, sones, color="blue")
-        plt.title("Loudness vs Time")
+        if len(valid_sones):
+            plt.plot(times, sones, color="blue")
+        else:
+            plt.text(
+                0.5,
+                0.5,
+                "sottek-hearing-model not installed\n(pip install sottek-hearing-model)",
+                ha="center",
+                va="center",
+                transform=plt.gca().transAxes,
+            )
+        plt.title(f"Loudness vs Time ({self.loudness_mode})")
         plt.xlabel("Time (s)")
-        plt.ylabel("Loudness (sone)")
+        plt.ylabel(f"Loudness ({unit_label})")
         plt.grid(True)
         plt.tight_layout()
 
@@ -829,12 +1091,25 @@ class LoudnessAnalyzer:
         plt.savefig(profile_png, dpi=300, bbox_inches="tight")
         plt.close()
 
-    def plot_specific_loudness(self, bark_axis, specific_loudness):
+    def plot_specific_loudness(
+        self, bark_axis, specific_loudness, unit_label="sone"
+    ):
+        spec_arr = np.asarray(specific_loudness, dtype=np.float64)
         plt.figure(figsize=(10, 5))
-        plt.plot(bark_axis, specific_loudness, color="red", linewidth=2)
-        plt.title("Specific Loudness Distribution")
+        if len(spec_arr) and not np.all(np.isnan(spec_arr)):
+            plt.plot(bark_axis, specific_loudness, color="red", linewidth=2)
+        else:
+            plt.text(
+                0.5,
+                0.5,
+                "Specific loudness unavailable\n(install sottek-hearing-model)",
+                ha="center",
+                va="center",
+                transform=plt.gca().transAxes,
+            )
+        plt.title(f"Specific Loudness Distribution ({self.loudness_mode})")
         plt.xlabel("Critical Band Rate (Bark)")
-        plt.ylabel("Specific Loudness (sone/Bark)")
+        plt.ylabel(f"Specific Loudness ({unit_label}/Bark)")
         plt.gca().xaxis.set_major_locator(MultipleLocator(1))
         plt.grid(True)
         plt.tight_layout()
@@ -959,6 +1234,14 @@ class LoudnessAnalyzer:
         frequencies,
         psd_db,
     ):
+        is_ecma_loudness = self.loudness_mode == LOUDNESS_ECMA
+        loudness_unit = "soneHMS" if is_ecma_loudness else "sone"
+        loudness_display = (
+            "N/A" if np.isnan(loudness) else f"{loudness:.2f} {loudness_unit}"
+        )
+        loudness_subplot_title = f"Loudness vs Time ({self.loudness_mode})"
+        specific_subplot_title = f"Specific Loudness ({self.loudness_mode})"
+
         is_ecma = self.tonality_mode == TONALITY_ECMA
         tonality_subplot_title = (
             "ECMA-418 (HMS) Tonality vs Time"
@@ -1021,10 +1304,10 @@ class LoudnessAnalyzer:
             rows=4,
             cols=1,
             subplot_titles=(
-                "Loudness vs Time",
+                loudness_subplot_title,
                 tonality_subplot_title,
                 "Frequency Spectrum (Welch PSD)",
-                "Specific Loudness",
+                specific_subplot_title,
             ),
             vertical_spacing=0.10,
         )
@@ -1035,7 +1318,7 @@ class LoudnessAnalyzer:
             col=1,
         )
         fig.update_xaxes(title_text="Time (s)", row=1, col=1)
-        fig.update_yaxes(title_text="Loudness (Sone)", row=1, col=1)
+        fig.update_yaxes(title_text=f"Loudness ({loudness_unit})", row=1, col=1)
 
         fig.add_trace(
             go.Scatter(
@@ -1069,13 +1352,13 @@ class LoudnessAnalyzer:
         fig.update_xaxes(type="log", title_text="Frequency (Hz)", row=3, col=1)
         fig.update_yaxes(title_text="Level (dB)", row=3, col=1)
         fig.update_xaxes(title_text="Bark", dtick=1, row=4, col=1)
-        fig.update_yaxes(title_text="Sone/Bark", row=4, col=1)
+        fig.update_yaxes(title_text=f"{loudness_unit}/Bark", row=4, col=1)
 
         fig.update_layout(
             height=1800,
             title=(
                 f"{Path(filename).name}<br>"
-                f"Loudness={loudness:.2f} sone | "
+                f"Loudness={loudness_display} | "
                 f"Phon={phon:.1f} | "
                 f"Sharpness={sharpness:.2f} acum | "
                 f"{tonality_badge} | "
@@ -1096,10 +1379,10 @@ class LoudnessAnalyzer:
                 <th>Reference Values & Real-Life Scale</th>
             </tr>
             <tr>
-                <td><strong>Loudness (sone)</strong></td>
+                <td><strong>ISO 532-1 Loudness (sone)</strong></td>
                 <td>
                     <strong>Definition:</strong> Linear psychoacoustic scale of perceived volume where doubling the sone value doubles the perceived loudness.<br>
-                    <strong>Calibration/Baseline:</strong> Calculated via ISO 532 (Zwicker method) scaled against a calibration factor derived from reference SPL meter measurements.
+                    <strong>Calibration/Baseline:</strong> Calculated via ISO 532-1 (Zwicker method) scaled against a calibration factor derived from reference SPL meter measurements.
                 </td>
                 <td>
                     <ul>
@@ -1111,6 +1394,19 @@ class LoudnessAnalyzer:
                 </td>
             </tr>
             <tr style="background-color: #f9f9f9;">
+                <td><strong>ECMA-418 Loudness (sone<sub>HMS</sub>)</strong></td>
+                <td>
+                    <strong>Definition:</strong> Psychoacoustic loudness computed via the Sottek Hearing Model (ECMA-418-2), separating tonal and broadband noise components before nonlinear combination.<br>
+                    <strong>Calibration/Baseline:</strong> Aligned with ISO 226:2023 equal-loudness contours (1.0 sone<sub>HMS</sub> corresponds to a 1 kHz tone at 40 dB SPL).
+                </td>
+                <td>
+                    <ul>
+                        <li><strong>1.0 sone<sub>HMS</sub> (Reference):</strong> 1 kHz tone at 40 dB SPL</li>
+                        <li><strong>Advantage:</strong> Improved correlation with human jury ratings on tonal machinery (EV motors, fans, inverters)</li>
+                    </ul>
+                </td>
+            </tr>
+            <tr>
                 <td><strong>Loudness Level (phon)</strong></td>
                 <td>
                     <strong>Definition:</strong> Logarithmic measure of loudness level mapped to human equal-loudness contours.<br>
@@ -1125,7 +1421,7 @@ class LoudnessAnalyzer:
                     </ul>
                 </td>
             </tr>
-            <tr>
+            <tr style="background-color: #f9f9f9;">
                 <td><strong>DIN 45681 Tonality (<i>K</i><sub>t</sub> in dB)</strong></td>
                 <td>
                     <strong>Definition:</strong> Evaluates prominent discrete frequency components (tones/hums) against surrounding masking noise.<br>
@@ -1188,8 +1484,9 @@ class LoudnessAnalyzer:
         <h2>Acoustic Analysis Report</h2>
         <table border="1" cellpadding="6" style="border-collapse: collapse;">
             <tr><td><strong>File</strong></td><td>{Path(filename).name}</td></tr>
+            <tr><td><strong>Loudness Standard</strong></td><td>{self.loudness_mode}</td></tr>
             <tr><td><strong>Tonality Standard</strong></td><td>{self.tonality_mode}</td></tr>
-            <tr><td><strong>Loudness</strong></td><td>{loudness:.2f} sone</td></tr>
+            <tr><td><strong>Loudness</strong></td><td>{loudness_display}</td></tr>
             <tr><td><strong>Phon</strong></td><td>{phon:.1f}</td></tr>
             <tr><td><strong>Sharpness</strong></td><td>{sharpness:.2f} acum</td></tr>
             {summary_row_html}
