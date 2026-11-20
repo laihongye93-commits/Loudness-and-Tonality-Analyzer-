@@ -665,21 +665,22 @@ class LoudnessAnalyzer:
             "<<ComboboxSelected>>", self.on_standard_selected
         )
 
-        # --- CENTER COLUMN: File Selection & Run ---
+        # --- CENTER COLUMN: File Selection, Run & Progress Bar ---
         center_frame = tk.Frame(control_frame)
         center_frame.grid(row=0, column=1)
 
         self.file_label = tk.Label(center_frame, text="No file selected", fg="blue")
         self.file_label.pack(pady=(0, 3))
 
-        tk.Button(
+        self.select_btn = tk.Button(
             center_frame,
             text="Select Audio File",
             width=22,
             command=self.select_file,
-        ).pack(pady=(0, 3))
+        )
+        self.select_btn.pack(pady=(0, 3))
 
-        run_btn = tk.Button(
+        self.run_btn = tk.Button(
             center_frame,
             text="Run Analysis",
             width=22,
@@ -687,7 +688,25 @@ class LoudnessAnalyzer:
             fg="white",
             command=self.start_analysis,
         )
-        run_btn.pack()
+        self.run_btn.pack()
+
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_bar = ttk.Progressbar(
+            center_frame,
+            variable=self.progress_var,
+            maximum=100.0,
+            length=180,
+            mode="determinate",
+        )
+        self.progress_bar.pack(pady=(8, 2))
+
+        self.progress_label = tk.Label(
+            center_frame,
+            text="Idle (0%)",
+            font=("Arial", 8),
+            fg="#555555",
+        )
+        self.progress_label.pack()
 
         # --- RIGHT COLUMN: Checkboxes ---
         right_frame = tk.Frame(control_frame)
@@ -719,6 +738,23 @@ class LoudnessAnalyzer:
         self.result_text.pack(fill="both", expand=True, padx=20, pady=15)
 
     # =================================================
+    def set_progress(self, value, status_text=None, running=None):
+        clamped = max(0.0, min(100.0, float(value)))
+
+        def _update():
+            self.progress_var.set(clamped)
+            if status_text is not None:
+                self.progress_label.config(text=f"{status_text} ({clamped:.0f}%)")
+            else:
+                self.progress_label.config(text=f"{clamped:.0f}%")
+
+            if running is not None:
+                state = "disabled" if running else "normal"
+                self.run_btn.config(state=state)
+                self.select_btn.config(state=state)
+
+        self.root.after(0, _update)
+
     def load_config(self):
         loaded_from_config = False
         try:
@@ -880,16 +916,19 @@ class LoudnessAnalyzer:
             loudness_standard=self.loudness_method_var.get(),
             tonality_standard=self.tonality_method_var.get(),
         )
+        self.set_progress(0.0, "Starting analysis", running=True)
         threading.Thread(target=self.analyze_file, daemon=True).start()
 
     def analyze_file(self):
         try:
             self.result_text.delete("1.0", tk.END)
             self.result_text.insert(tk.END, "Loading file...\n\n")
+            self.set_progress(5.0, "Loading audio")
 
             signal, fs = load_audio(self.filename)
             signal = signal * self.calibration_factor
             duration = len(signal) / fs
+            self.set_progress(12.0, "Audio loaded")
 
             self.result_text.insert(tk.END, f"File: {Path(self.filename).name}\n")
             self.result_text.insert(tk.END, f"Sample Rate: {fs} Hz\n")
@@ -905,6 +944,7 @@ class LoudnessAnalyzer:
             sone_unit = "soneHMS" if is_ecma_loudness else "sones"
 
             # Always compute Zwicker loudness for DIN Sharpness compatibility
+            self.set_progress(18.0, "Calculating loudness & sharpness")
             N_zw, N_spec_zw, bark_zw = loudness_zwst(signal, fs)
             sharpness = sharpness_din_from_loudness(N_zw, N_spec_zw)
 
@@ -912,11 +952,13 @@ class LoudnessAnalyzer:
                 self.result_text.insert(
                     tk.END, "Generating ECMA-418 (HMS) loudness profile...\n"
                 )
+                self.set_progress(25.0, "Computing ECMA-418 loudness")
                 N, times_hms, sones_hms, bark_axis, N_specific = (
                     ecma418_loudness_analysis(signal, fs)
                 )
                 self.bark_axis = bark_axis
                 self.N_specific = N_specific
+                self.set_progress(40.0, "Plotting loudness profile")
                 self.save_and_plot_profile(times_hms, sones_hms, sone_unit)
             else:
                 N = float(N_zw)
@@ -924,13 +966,19 @@ class LoudnessAnalyzer:
                 self.N_specific = N_spec_zw
                 self.compute_zwicker_profile(signal, fs, sone_unit)
 
+            self.set_progress(46.0, "Calculating phon & SPL(A)")
             phon = sone_to_phon(float(N))
             dba = calculate_dba(signal, fs)
 
+            self.set_progress(52.0, "Analyzing tonality")
             tonality_png = self.plot_tonality(signal, fs)
+
+            self.set_progress(62.0, "Plotting specific loudness")
             self.plot_specific_loudness(
                 self.bark_axis, self.N_specific, sone_unit
             )
+
+            self.set_progress(70.0, "Plotting frequency spectrum")
             spectrum_png = self.plot_frequency_spectrum(signal, fs)
 
             if self.tonality_mode == TONALITY_ECMA:
@@ -974,6 +1022,7 @@ class LoudnessAnalyzer:
             tonality_png_path = Path(tonality_png)
 
             if self.save_xlsx_var.get():
+                self.set_progress(78.0, "Saving XLSX summary")
                 summary_file = Path(self.filename).with_suffix(".summary.xlsx")
                 wb = Workbook()
                 ws = wb.active
@@ -1076,6 +1125,7 @@ class LoudnessAnalyzer:
                     tk.END, f"Summary saved:\n{summary_file}\n\n"
                 )
 
+            self.set_progress(88.0, "Generating HTML report")
             html_file = Path(self.filename).with_suffix(".summary.html")
             self.save_html_report(
                 html_file,
@@ -1094,6 +1144,7 @@ class LoudnessAnalyzer:
             )
 
             if not self.save_png_var.get():
+                self.set_progress(95.0, "Cleaning up PNG files")
                 for p_file in [
                     profile_png,
                     specific_png,
@@ -1109,9 +1160,11 @@ class LoudnessAnalyzer:
                     tk.END, "Intermediate PNG plots cleaned up.\n\n"
                 )
 
+            self.set_progress(100.0, "Complete", running=False)
             os.startfile(html_file)
 
         except Exception as e:
+            self.set_progress(0.0, "Error", running=False)
             messagebox.showerror("Analysis Error", str(e))
 
     def compute_zwicker_profile(self, signal, fs, unit_label="sones"):
@@ -1124,7 +1177,10 @@ class LoudnessAnalyzer:
             tk.END, "Generating ISO 532-1 (Zwicker) loudness profile...\n"
         )
 
-        for start in range(0, len(signal) - window, hop):
+        starts = list(range(0, max(0, len(signal) - window), hop))
+        total_steps = max(1, len(starts))
+
+        for idx, start in enumerate(starts):
             try:
                 frame = signal[start : start + window]
                 result = loudness_zwst(frame, fs)
@@ -1133,6 +1189,10 @@ class LoudnessAnalyzer:
                 sones.append(loudness)
             except Exception:
                 pass
+
+            if idx % 10 == 0 or idx == total_steps - 1:
+                pct = 20.0 + (idx + 1) / total_steps * 22.0
+                self.set_progress(pct, "Computing Zwicker profile")
 
         self.save_and_plot_profile(times, sones, unit_label)
 
